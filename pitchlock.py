@@ -48,7 +48,7 @@ STRETCH_OFFSET_Y = 0.008   # release point drops slightly in stretch
 # ---------------------------------------------------------------------------
 # Version (used by auto-updater)
 # ---------------------------------------------------------------------------
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # Path resolution: robustly find pitchers_db.json across multiple locations
 try:
@@ -371,7 +371,8 @@ class OutputBridge:
     @classmethod
     def write(cls, pitcher: dict, box: dict, batter: dict = None,
               strike_zone: dict = None, stretch: bool = False,
-              screen_w: int = SCREEN_W, screen_h: int = SCREEN_H):
+              screen_w: int = SCREEN_W, screen_h: int = SCREEN_H,
+              lineup: list = None):
         payload = {
             "pitcher_name": pitcher["name"],
             "team": pitcher["team"],
@@ -413,6 +414,29 @@ class OutputBridge:
                 },
             }
 
+        # Include full 1-9 lineup with per-batter strike zone coordinates
+        if lineup:
+            sz_calc = StrikeZoneCalculator(screen_w, screen_h)
+            lineup_data = []
+            for b in lineup:
+                zone = sz_calc.get_zone(b["height_inches"])
+                lineup_data.append({
+                    "position": b.get("position", 0),
+                    "name": b["name"],
+                    "height_inches": b["height_inches"],
+                    "strike_zone": {
+                        "top_y": zone["top_px"],
+                        "bottom_y": zone["bottom_px"],
+                        "left_x": zone["left_px"],
+                        "right_x": zone["right_px"],
+                        "width": zone["width_px"],
+                        "height": zone["height_px"],
+                        "center_x": zone["center_x_px"],
+                        "center_y": zone["center_y_px"],
+                    },
+                })
+            payload["lineup"] = lineup_data
+
         # Write to every plausible directory so the DLL finds the file
         # regardless of where MLB_Vision.py loaded pitchlock from.
         output_dirs = cls._output_dirs()
@@ -437,21 +461,22 @@ class LineupDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("Manage Lineup")
         self.configure(bg=COLORS["bg_dark"])
-        self.geometry("480x620")
+        self.geometry("520x650")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
         self.lineup = [dict(b) for b in lineup]  # deep copy
         self.result = None
+        self._sz_calc = StrikeZoneCalculator()
 
         self._build_ui()
         self._populate_slots()
 
         # Center on parent
         self.update_idletasks()
-        px = parent.winfo_x() + (parent.winfo_width() - 480) // 2
-        py = parent.winfo_y() + (parent.winfo_height() - 620) // 2
+        px = parent.winfo_x() + (parent.winfo_width() - 520) // 2
+        py = parent.winfo_y() + (parent.winfo_height() - 650) // 2
         self.geometry(f"+{px}+{py}")
 
     def _build_ui(self):
@@ -464,7 +489,7 @@ class LineupDialog(tk.Toplevel):
                  fg=COLORS["accent_cyan"],
                  bg=COLORS["bg_dark"]).pack(side="left")
 
-        tk.Label(header, text="Set batter heights for auto strike zone",
+        tk.Label(header, text="Heights auto-calculate strike zone coords",
                  font=("Segoe UI", 9),
                  fg=COLORS["text_secondary"],
                  bg=COLORS["bg_dark"]).pack(side="right")
@@ -582,8 +607,26 @@ class LineupDialog(tk.Toplevel):
                      fg=COLORS["text_secondary"],
                      bg=COLORS["bg_card"]).pack(side="left")
 
+            # Live strike zone coordinate preview
+            coords_lbl = tk.Label(
+                slot, text="",
+                font=("Segoe UI", 8),
+                fg=COLORS["accent_green"],
+                bg=COLORS["bg_card"])
+            coords_lbl.pack(side="right", padx=(4, 8))
+
             self.height_ft_vars.append(ft_var)
             self.height_in_vars.append(in_var)
+
+            # Bind height changes to update coordinate preview
+            ft_var.trace_add("write",
+                             lambda *a, lbl=coords_lbl, fv=ft_var,
+                             iv=in_var: self._update_coords_preview(
+                                 lbl, fv, iv))
+            in_var.trace_add("write",
+                             lambda *a, lbl=coords_lbl, fv=ft_var,
+                             iv=in_var: self._update_coords_preview(
+                                 lbl, fv, iv))
 
             # Pre-fill from existing lineup
             if i < len(self.lineup):
@@ -624,6 +667,24 @@ class LineupDialog(tk.Toplevel):
 
         self.result = lineup
         self.destroy()
+
+    def _update_coords_preview(self, label, ft_var, in_var):
+        """Update the coordinate preview label when height changes."""
+        try:
+            ft_str = ft_var.get().strip()
+            in_str = in_var.get().strip()
+            ft = int(ft_str) if ft_str else 0
+            inches = int(in_str) if in_str else 0
+            total = ft * 12 + inches
+            if 60 <= total <= 84:
+                zone = self._sz_calc.get_zone(total)
+                label.configure(
+                    text=f"SZ: T{zone['top_px']} B{zone['bottom_px']} "
+                         f"{zone['width_px']}x{zone['height_px']}")
+            else:
+                label.configure(text="")
+        except (ValueError, TypeError):
+            label.configure(text="")
 
     def _on_clear(self, event=None):
         for i in range(9):
@@ -1246,17 +1307,24 @@ class PitchLockApp(tk.Tk):
                 slot, text="",
                 font=("Segoe UI", 7),
                 fg=COLORS["text_dim"], bg=COLORS["bg_card"])
-            ht_lbl.pack(pady=(0, 2))
+            ht_lbl.pack()
+
+            coords_lbl = tk.Label(
+                slot, text="",
+                font=("Segoe UI", 6),
+                fg=COLORS["accent_green"], bg=COLORS["bg_card"])
+            coords_lbl.pack(pady=(0, 2))
 
             self.lineup_slot_labels.append({
                 "frame": slot,
                 "num": num_lbl,
                 "name": name_lbl,
                 "height": ht_lbl,
+                "coords": coords_lbl,
             })
 
             # Click to select this batter
-            for w in [slot, num_lbl, name_lbl, ht_lbl]:
+            for w in [slot, num_lbl, name_lbl, ht_lbl, coords_lbl]:
                 w.bind("<Button-1>",
                        lambda e, idx=i: self._on_click_lineup_slot(idx))
 
@@ -1444,7 +1512,8 @@ class PitchLockApp(tk.Tk):
             OutputBridge.write(self.selected_pitcher, box, batter, strike_zone,
                                stretch=stretch,
                                screen_w=self.calculator.screen_w,
-                               screen_h=self.calculator.screen_h)
+                               screen_h=self.calculator.screen_h,
+                               lineup=self.lineup if self.lineup else None)
         except Exception as exc:
             self.lbl_status.configure(
                 text=f"Write error: {exc}",
@@ -1601,6 +1670,11 @@ class PitchLockApp(tk.Tk):
                 slot["name"].configure(text=name)
                 slot["height"].configure(text=f"{h_ft}'{h_in}\"")
 
+                # Show strike zone coordinates for this batter
+                zone = self.sz_calculator.get_zone(h)
+                slot["coords"].configure(
+                    text=f"T:{zone['top_px']} B:{zone['bottom_px']}")
+
                 if i == self.active_batter_index:
                     # Active batter highlight
                     bg = COLORS["bg_selected"]
@@ -1610,6 +1684,8 @@ class PitchLockApp(tk.Tk):
                         fg=COLORS["accent_cyan"], bg=bg)
                     slot["height"].configure(
                         fg=COLORS["text_primary"], bg=bg)
+                    slot["coords"].configure(
+                        fg=COLORS["accent_green"], bg=bg)
                     slot["frame"].configure(bg=bg)
                 else:
                     bg = COLORS["bg_card"]
@@ -1619,12 +1695,16 @@ class PitchLockApp(tk.Tk):
                         fg=COLORS["text_secondary"], bg=bg)
                     slot["height"].configure(
                         fg=COLORS["text_dim"], bg=bg)
+                    slot["coords"].configure(
+                        fg=COLORS["accent_green"], bg=bg)
                     slot["frame"].configure(bg=bg)
             else:
                 slot["name"].configure(text="--",
                                        fg=COLORS["text_dim"],
                                        bg=COLORS["bg_card"])
                 slot["height"].configure(text="",
+                                         bg=COLORS["bg_card"])
+                slot["coords"].configure(text="",
                                          bg=COLORS["bg_card"])
                 slot["num"].configure(fg=COLORS["text_dim"],
                                       bg=COLORS["bg_card"])
