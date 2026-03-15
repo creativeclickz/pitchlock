@@ -28,10 +28,27 @@ import traceback
 SCREEN_W = 1920
 SCREEN_H = 1080
 
+# Common resolution presets
+RESOLUTION_PRESETS = {
+    "1920x1080 (1080p)": (1920, 1080),
+    "2560x1440 (1440p)": (2560, 1440),
+    "3840x2160 (4K)": (3840, 2160),
+    "1280x720 (720p)": (1280, 720),
+    "1600x900": (1600, 900),
+    "2560x1080 (UW)": (2560, 1080),
+    "3440x1440 (UW)": (3440, 1440),
+}
+
+# Stretch delivery adjustments (normalized offsets)
+# When a pitcher goes to the stretch with runners on base, their release
+# point shifts slightly compared to the windup.
+STRETCH_OFFSET_X = 0.003   # slight horizontal shift
+STRETCH_OFFSET_Y = 0.008   # release point drops slightly in stretch
+
 # ---------------------------------------------------------------------------
 # Version (used by auto-updater)
 # ---------------------------------------------------------------------------
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Path resolution: robustly find pitchers_db.json across multiple locations
 try:
@@ -169,14 +186,28 @@ class DetectionBoxCalculator:
         self.screen_w = screen_w
         self.screen_h = screen_h
 
-    def get_box(self, pitcher: dict) -> dict:
+    def get_box(self, pitcher: dict, stretch: bool = False) -> dict:
         """Return pixel coordinates for the detection box.
+
+        Args:
+            pitcher: Pitcher data dict with release_x, release_y, etc.
+            stretch: If True, adjust release point for stretch delivery
+                     (runners on base).
 
         Returns dict with keys: x, y, w, h, cx, cy
         where (x, y) is top-left corner and (cx, cy) is center.
         """
-        cx = int(pitcher["release_x"] * self.screen_w)
-        cy = int(pitcher["release_y"] * self.screen_h)
+        rel_x = pitcher["release_x"]
+        rel_y = pitcher["release_y"]
+
+        if stretch:
+            # Stretch delivery: release point shifts slightly
+            is_righty = pitcher["throws"] == "R"
+            rel_x += STRETCH_OFFSET_X * (1 if is_righty else -1)
+            rel_y += STRETCH_OFFSET_Y
+
+        cx = int(rel_x * self.screen_w)
+        cy = int(rel_y * self.screen_h)
         w = int(pitcher["box_w"] * self.screen_w)
         h = int(pitcher["box_h"] * self.screen_h)
         x = cx - w // 2
@@ -303,15 +334,19 @@ class OutputBridge:
     file so the MLB_Vision.py CV script can pick them up at runtime."""
 
     OUTPUT_FILE = os.path.join(SCRIPT_DIR, "mlb_settings.json")
+    # Also write to release_point_output.json for backwards compatibility
+    LEGACY_OUTPUT_FILE = os.path.join(SCRIPT_DIR, "release_point_output.json")
 
     @classmethod
     def write(cls, pitcher: dict, box: dict, batter: dict = None,
-              strike_zone: dict = None):
+              strike_zone: dict = None, stretch: bool = False,
+              screen_w: int = SCREEN_W, screen_h: int = SCREEN_H):
         payload = {
             "pitcher_name": pitcher["name"],
             "team": pitcher["team"],
             "throws": pitcher["throws"],
             "arm_slot": pitcher["arm_slot"],
+            "delivery_mode": "stretch" if stretch else "windup",
             "detection_box": {
                 "x": box["x"],
                 "y": box["y"],
@@ -320,7 +355,7 @@ class OutputBridge:
                 "center_x": box["cx"],
                 "center_y": box["cy"],
             },
-            "screen_resolution": {"w": SCREEN_W, "h": SCREEN_H},
+            "screen_resolution": {"w": screen_w, "h": screen_h},
         }
 
         # Add strike zone data if a batter is active
@@ -347,8 +382,14 @@ class OutputBridge:
                 },
             }
 
-        with open(cls.OUTPUT_FILE, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
+        # Write to both files so the CV pipeline picks it up regardless of
+        # which filename it reads from
+        for path in (cls.OUTPUT_FILE, cls.LEGACY_OUTPUT_FILE):
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, indent=2)
+            except OSError:
+                pass  # best-effort for legacy file
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +636,13 @@ class PitchLockApp(tk.Tk):
         self.selected_pitcher = None
         self.filtered_pitchers = list(self.pitchers)
 
+        # Stretch mode (runners on base)
+        self.stretch_mode = tk.BooleanVar(value=False)
+        self.stretch_mode.trace_add("write", self._on_stretch_toggle)
+
+        # Resolution
+        self.resolution_var = tk.StringVar(value="1920x1080 (1080p)")
+
         # Lineup data
         self.lineup = []
         self.active_batter_index = -1
@@ -706,6 +754,7 @@ class PitchLockApp(tk.Tk):
 
         self._build_batter_bar(right)
         self._build_detail_panel(right)
+        self._build_settings_bar(right)
         self._build_visualization(right)
         self._build_action_buttons(right)
 
@@ -986,6 +1035,77 @@ class PitchLockApp(tk.Tk):
         val.pack(anchor="w")
         return val
 
+    # -- Settings Bar (Stretch Mode + Resolution) --
+    def _build_settings_bar(self, parent):
+        settings_frame = tk.Frame(parent, bg=COLORS["bg_panel"])
+        settings_frame.pack(fill="x", padx=10, pady=(4, 0))
+
+        # Stretch mode toggle
+        stretch_frame = tk.Frame(settings_frame, bg=COLORS["bg_panel"])
+        stretch_frame.pack(side="left", padx=(0, 16))
+
+        self.chk_stretch = tk.Checkbutton(
+            stretch_frame, text="STRETCH",
+            variable=self.stretch_mode,
+            font=("Segoe UI", 9, "bold"),
+            fg=COLORS["text_secondary"], bg=COLORS["bg_panel"],
+            selectcolor=COLORS["bg_entry"],
+            activebackground=COLORS["bg_panel"],
+            activeforeground=COLORS["accent_cyan"],
+            cursor="hand2")
+        self.chk_stretch.pack(side="left")
+
+        tk.Label(stretch_frame, text="(runners on)",
+                 font=("Segoe UI", 8),
+                 fg=COLORS["text_dim"], bg=COLORS["bg_panel"]).pack(
+            side="left", padx=(2, 0))
+
+        # Resolution selector
+        res_frame = tk.Frame(settings_frame, bg=COLORS["bg_panel"])
+        res_frame.pack(side="right")
+
+        tk.Label(res_frame, text="RES:",
+                 font=("Segoe UI", 8, "bold"),
+                 fg=COLORS["text_dim"], bg=COLORS["bg_panel"]).pack(
+            side="left", padx=(0, 4))
+
+        res_combo = ttk.Combobox(
+            res_frame, textvariable=self.resolution_var,
+            values=list(RESOLUTION_PRESETS.keys()),
+            width=18, state="readonly", font=("Segoe UI", 9))
+        res_combo.pack(side="left")
+        res_combo.bind("<<ComboboxSelected>>", self._on_resolution_change)
+
+    def _on_stretch_toggle(self, *args):
+        """Called when the stretch checkbox is toggled."""
+        if self.selected_pitcher:
+            stretch = self.stretch_mode.get()
+            box = self.calculator.get_box(self.selected_pitcher, stretch=stretch)
+            self.stat_release_x.configure(text=f"{box['cx']} px")
+            self.stat_release_y.configure(text=f"{box['cy']} px")
+            self.stat_box_size.configure(text=f"{box['w']}x{box['h']}")
+            self._draw_release_point(self.selected_pitcher)
+            self._on_apply()
+
+    def _on_resolution_change(self, event=None):
+        """Called when the resolution dropdown changes."""
+        global SCREEN_W, SCREEN_H
+        res_label = self.resolution_var.get()
+        w, h = RESOLUTION_PRESETS.get(res_label, (1920, 1080))
+        SCREEN_W = w
+        SCREEN_H = h
+        self.calculator = DetectionBoxCalculator(screen_w=w, screen_h=h)
+        self.sz_calculator = StrikeZoneCalculator()
+        # Re-apply if a pitcher is selected
+        if self.selected_pitcher:
+            stretch = self.stretch_mode.get()
+            box = self.calculator.get_box(self.selected_pitcher, stretch=stretch)
+            self.stat_release_x.configure(text=f"{box['cx']} px")
+            self.stat_release_y.configure(text=f"{box['cy']} px")
+            self.stat_box_size.configure(text=f"{box['w']}x{box['h']}")
+            self._draw_release_point(self.selected_pitcher)
+            self._on_apply()
+
     # -- Visualization --
     def _build_visualization(self, parent):
         viz_label = tk.Label(
@@ -1255,7 +1375,8 @@ class PitchLockApp(tk.Tk):
         h_in = pitcher["height_inches"] % 12
         self.stat_height.configure(text=f"{h_ft}'{h_in}\"")
 
-        box = self.calculator.get_box(pitcher)
+        stretch = self.stretch_mode.get()
+        box = self.calculator.get_box(pitcher, stretch=stretch)
         self.stat_release_x.configure(text=f"{box['cx']} px")
         self.stat_release_y.configure(text=f"{box['cy']} px")
         self.stat_box_size.configure(text=f"{box['w']}x{box['h']}")
@@ -1274,7 +1395,8 @@ class PitchLockApp(tk.Tk):
                                       fg=COLORS["accent_red"])
             return
 
-        box = self.calculator.get_box(self.selected_pitcher)
+        stretch = self.stretch_mode.get()
+        box = self.calculator.get_box(self.selected_pitcher, stretch=stretch)
 
         # Get active batter + strike zone if lineup is set
         batter = None
@@ -1285,7 +1407,10 @@ class PitchLockApp(tk.Tk):
                 batter["height_inches"])
 
         try:
-            OutputBridge.write(self.selected_pitcher, box, batter, strike_zone)
+            OutputBridge.write(self.selected_pitcher, box, batter, strike_zone,
+                               stretch=stretch,
+                               screen_w=self.calculator.screen_w,
+                               screen_h=self.calculator.screen_h)
         except Exception as exc:
             self.lbl_status.configure(
                 text=f"Write error: {exc}",
@@ -1293,7 +1418,8 @@ class PitchLockApp(tk.Tk):
             return
 
         name = self.selected_pitcher["name"]
-        status_parts = [f"Applied: {name} ({box['cx']}, {box['cy']})"]
+        mode = "STR" if stretch else "WU"
+        status_parts = [f"Applied: {name} ({box['cx']}, {box['cy']}) [{mode}]"]
         if batter:
             status_parts.append(f"| SZ: {batter['name']}")
         self.lbl_status.configure(
@@ -1309,8 +1435,10 @@ class PitchLockApp(tk.Tk):
                                       fg=COLORS["accent_red"])
             return
 
-        box = self.calculator.get_box(self.selected_pitcher)
-        text = (f"{self.selected_pitcher['name']} | "
+        stretch = self.stretch_mode.get()
+        box = self.calculator.get_box(self.selected_pitcher, stretch=stretch)
+        mode = "Stretch" if stretch else "Windup"
+        text = (f"{self.selected_pitcher['name']} ({mode}) | "
                 f"X:{box['x']} Y:{box['y']} W:{box['w']} H:{box['h']} | "
                 f"Center:({box['cx']},{box['cy']})")
 
@@ -1487,6 +1615,8 @@ class PitchLockApp(tk.Tk):
             "active_batter_index": self.active_batter_index,
             "last_pitcher_name": (self.selected_pitcher["name"]
                                   if self.selected_pitcher else None),
+            "stretch_mode": self.stretch_mode.get(),
+            "resolution": self.resolution_var.get(),
         }
         StateManager.save(state)
 
@@ -1505,6 +1635,16 @@ class PitchLockApp(tk.Tk):
                 self.active_batter_index = 0
             self._update_batter_display()
             self._update_lineup_strip()
+
+        # Restore stretch mode
+        saved_stretch = state.get("stretch_mode", False)
+        self.stretch_mode.set(saved_stretch)
+
+        # Restore resolution
+        saved_res = state.get("resolution", "1920x1080 (1080p)")
+        if saved_res in RESOLUTION_PRESETS:
+            self.resolution_var.set(saved_res)
+            self._on_resolution_change()
 
         # Restore last selected pitcher
         last_pitcher = state.get("last_pitcher_name")
