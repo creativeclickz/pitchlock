@@ -333,9 +333,20 @@ class OutputBridge:
     """Writes the current detection-box and strike-zone values to a shared
     file so the MLB_Vision.py CV script can pick them up at runtime."""
 
-    OUTPUT_FILE = os.path.join(SCRIPT_DIR, "mlb_settings.json")
-    # Also write to release_point_output.json for backwards compatibility
-    LEGACY_OUTPUT_FILE = os.path.join(SCRIPT_DIR, "release_point_output.json")
+    # Build list of all directories we should write output to.
+    # MLB_Vision.py does os.chdir() to its own directory and passes that path
+    # to the DLL — so the DLL reads settings from MLB_Vision's folder, NOT
+    # from pitchlock.py's folder.  We write to every plausible location so
+    # the CV pipeline always finds the file.
+    _OUTPUT_DIRS = []
+    for _d in dict.fromkeys([
+        SCRIPT_DIR,                                      # next to pitchlock.py
+        os.getcwd(),                                     # CWD (MLB_Vision sets this)
+        os.path.dirname(SCRIPT_DIR),                     # parent of pitchlock.py
+        os.path.join(os.path.dirname(SCRIPT_DIR), ".."), # grandparent
+    ]):
+        if _d and os.path.isdir(_d):
+            _OUTPUT_DIRS.append(os.path.realpath(_d))
 
     @classmethod
     def write(cls, pitcher: dict, box: dict, batter: dict = None,
@@ -382,14 +393,20 @@ class OutputBridge:
                 },
             }
 
-        # Write to both files so the CV pipeline picks it up regardless of
-        # which filename it reads from
-        for path in (cls.OUTPUT_FILE, cls.LEGACY_OUTPUT_FILE):
-            try:
-                with open(path, "w", encoding="utf-8") as fh:
-                    json.dump(payload, fh, indent=2)
-            except OSError:
-                pass  # best-effort for legacy file
+        # Write both filenames to every candidate directory so the DLL
+        # finds the data no matter where it looks.
+        written = False
+        for d in cls._OUTPUT_DIRS:
+            for fname in ("mlb_settings.json", "release_point_output.json"):
+                try:
+                    p = os.path.join(d, fname)
+                    with open(p, "w", encoding="utf-8") as fh:
+                        json.dump(payload, fh, indent=2)
+                    written = True
+                except OSError:
+                    pass
+        if not written:
+            raise OSError("Could not write output to any location")
 
 
 # ---------------------------------------------------------------------------
