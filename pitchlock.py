@@ -1755,7 +1755,7 @@ class PitchLockApp(tk.Tk):
 
 _GITHUB_USER = "creativeclickz"
 _GITHUB_REPO = "pitchlock"
-_GITHUB_BRANCH = "main"
+_GITHUB_BRANCH = "release"
 
 _RAW_BASE = (f"https://raw.githubusercontent.com/"
              f"{_GITHUB_USER}/{_GITHUB_REPO}/{_GITHUB_BRANCH}")
