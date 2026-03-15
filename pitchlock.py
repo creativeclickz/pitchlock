@@ -48,7 +48,7 @@ STRETCH_OFFSET_Y = 0.008   # release point drops slightly in stretch
 # ---------------------------------------------------------------------------
 # Version (used by auto-updater)
 # ---------------------------------------------------------------------------
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Path resolution: robustly find pitchers_db.json across multiple locations
 try:
@@ -331,22 +331,42 @@ class StateManager:
 
 class OutputBridge:
     """Writes the current detection-box and strike-zone values to a shared
-    file so the MLB_Vision.py CV script can pick them up at runtime."""
+    file so the MLB_Vision.py CV script can pick them up at runtime.
 
-    # Build list of all directories we should write output to.
-    # MLB_Vision.py does os.chdir() to its own directory and passes that path
-    # to the DLL — so the DLL reads settings from MLB_Vision's folder, NOT
-    # from pitchlock.py's folder.  We write to every plausible location so
-    # the CV pipeline always finds the file.
-    _OUTPUT_DIRS = []
-    for _d in dict.fromkeys([
-        SCRIPT_DIR,                                      # next to pitchlock.py
-        os.getcwd(),                                     # CWD (MLB_Vision sets this)
-        os.path.dirname(SCRIPT_DIR),                     # parent of pitchlock.py
-        os.path.join(os.path.dirname(SCRIPT_DIR), ".."), # grandparent
-    ]):
-        if _d and os.path.isdir(_d):
-            _OUTPUT_DIRS.append(os.path.realpath(_d))
+    MLB_Vision.py does os.chdir(os.path.dirname(__file__)) at init and
+    passes its own directory to the DLL.  The DLL reads settings from
+    MLB_Vision's folder — which is NOT the same as pitchlock.py's folder.
+    To guarantee the DLL sees the file we write to EVERY plausible
+    directory at write-time (CWD, script dir, parent, grandparent, and
+    the sys.argv[0] directory).
+    """
+
+    OUTPUT_FILENAMES = ["mlb_settings.json", "release_point_output.json"]
+
+    @classmethod
+    def _output_dirs(cls):
+        """Return a de-duplicated list of directories to write output to."""
+        dirs = []
+        # 1. CWD — MLB_Vision.py sets this to its own folder via os.chdir
+        dirs.append(os.getcwd())
+        # 2. PitchLock's own folder
+        dirs.append(SCRIPT_DIR)
+        # 3. Parent of PitchLock (if pitchlock is in a subfolder)
+        dirs.append(os.path.dirname(SCRIPT_DIR))
+        # 4. Grandparent (two levels up)
+        dirs.append(os.path.dirname(os.path.dirname(SCRIPT_DIR)))
+        # 5. sys.argv[0] directory (wherever the launcher lives)
+        if sys.argv and sys.argv[0]:
+            dirs.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+        # De-duplicate while preserving order
+        seen = set()
+        unique = []
+        for d in dirs:
+            d = os.path.normpath(d)
+            if d not in seen and os.path.isdir(d):
+                seen.add(d)
+                unique.append(d)
+        return unique
 
     @classmethod
     def write(cls, pitcher: dict, box: dict, batter: dict = None,
@@ -393,20 +413,17 @@ class OutputBridge:
                 },
             }
 
-        # Write both filenames to every candidate directory so the DLL
-        # finds the data no matter where it looks.
-        written = False
-        for d in cls._OUTPUT_DIRS:
-            for fname in ("mlb_settings.json", "release_point_output.json"):
+        # Write to every plausible directory so the DLL finds the file
+        # regardless of where MLB_Vision.py loaded pitchlock from.
+        output_dirs = cls._output_dirs()
+        for d in output_dirs:
+            for fname in cls.OUTPUT_FILENAMES:
+                path = os.path.join(d, fname)
                 try:
-                    p = os.path.join(d, fname)
-                    with open(p, "w", encoding="utf-8") as fh:
+                    with open(path, "w", encoding="utf-8") as fh:
                         json.dump(payload, fh, indent=2)
-                    written = True
                 except OSError:
-                    pass
-        if not written:
-            raise OSError("Could not write output to any location")
+                    pass  # best-effort; skip dirs we can't write to
 
 
 # ---------------------------------------------------------------------------
